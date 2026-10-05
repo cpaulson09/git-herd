@@ -99,6 +99,9 @@ The keys are listed under the dashboard, one per line:
 | `r` | Refresh from GitHub: fetch every repo and refresh PR status, in the background |
 | `q` | Quit |
 
+While a delete runs, the status line shows `⏳ Deleting …`; `x` shows `⏳ Deleting 2 of 5: …`
+for each item. A worktree with `node_modules` can take a few seconds.
+
 Under the keys, a "This session" list shows the latest 8 deletes and undos, with the time. New cleanup
 items and auto-deletes send a Mac notification through the terminal.
 

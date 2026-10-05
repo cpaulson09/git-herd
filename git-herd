@@ -438,32 +438,39 @@ safe_to_delete() {
   return 0
 }
 
+# With show_progress=1 on a terminal, a "⏳ Deleting 2 of 5: ..." line shows
+# while each item runs; its ✓ or ✗ line then takes its place.
 run_actions() {
-  local entry ok=0 failed=0
+  local entry ok=0 failed=0 n=0 progress=0 clr=""
   local -a a
+  (( show_progress )) && [[ -t 1 ]] && progress=1 clr=$'\r\e[2K'
   for entry in "$@"; do
     a=("${(@ps:\t:)entry}")
     local repo=$a[1] step=$a[2] wt=$a[3] mode=$a[4] br=$a[5] sha=$a[6] err=""
+    (( ++n ))
+    if (( progress )); then
+      print -rn -- "$(cut_to "⏳ Deleting $n of $#: ${$(describe_action $entry)//  ##/ }…" ${term_cols:-80})"
+    fi
     # Last check before anything is deleted, whatever put it on the list.
     if [[ $mode != - ]] && ! safe_to_delete $repo $br; then
-      print "${RED}✗${R} ${repo:t} $br: refused, this is the default, a protected, or the checked-out branch"
+      print "${clr}${RED}✗${R} ${repo:t} $br: refused, this is the default, a protected, or the checked-out branch"
       session_note "${RED}✗${R} ${repo:t} $br: refused (default, protected, or checked out)${run_tag:+ ${CFR}(${run_tag})${R}}"
       (( failed++ )); continue
     fi
     if [[ $step == remove && ${wt:A} == ${repo:A} ]]; then
-      print "${RED}✗${R} ${repo:t}: refused to remove the repo's main folder"
+      print "${clr}${RED}✗${R} ${repo:t}: refused to remove the repo's main folder"
       session_note "${RED}✗${R} ${repo:t}: refused to remove the main folder${run_tag:+ ${CFR}(${run_tag})${R}}"
       (( failed++ )); continue
     fi
     case $step in
-      remove) err=$(git -C $repo worktree remove $wt 2>&1) || { print "${RED}✗${R} ${repo:t}: $err"; session_note "${RED}✗${R} ${repo:t}: ${err%%$'\n'*}"; (( failed++ )); continue } ;;
+      remove) err=$(git -C $repo worktree remove $wt 2>&1) || { print "${clr}${RED}✗${R} ${repo:t}: $err"; session_note "${RED}✗${R} ${repo:t}: ${err%%$'\n'*}"; (( failed++ )); continue } ;;
       prune)  git -C $repo worktree prune 2>/dev/null ;;
     esac
     if [[ $mode != - ]]; then
-      err=$(git -C $repo branch -$mode $br 2>&1) || { print "${RED}✗${R} ${repo:t} $br: $err"; session_note "${RED}✗${R} ${repo:t} $br: ${err%%$'\n'*}"; (( failed++ )); continue }
+      err=$(git -C $repo branch -$mode $br 2>&1) || { print "${clr}${RED}✗${R} ${repo:t} $br: $err"; session_note "${RED}✗${R} ${repo:t} $br: ${err%%$'\n'*}"; (( failed++ )); continue }
       print -r -- "$(date '+%F %T')	$repo	$br	$sha	${run_tag:-manual}" >> $log_file
     fi
-    print "${GRN}✓${R} $(describe_action $entry)"
+    print "${clr}${GRN}✓${R} $(describe_action $entry)"
     session_note "${GRN}✓${R} ${$(describe_action $entry)//  ##/ }${run_tag:+ ${CFR}(${run_tag})${R}}"
     (( ok++ ))
   done
@@ -498,7 +505,7 @@ cut_flow() {
   fi
   (( $#chosen )) || { print "Nothing deleted."; return 0 }
   for i in $chosen; do picked+=("$actions[$i]"); done
-  run_actions $picked
+  show_progress=1 run_actions $picked
 }
 
 # ---------------------------------------------------------------- undo (u)
@@ -942,7 +949,8 @@ if (( watch )); then
   screen_on()  { print -n $'\e[?1049h\e[?25l\e[H\e[2J' }
   screen_off() { print -n $'\e[?25h\e[?1049l' }
   last_auto=0 status_msg="" status_ttl=0 fetching=0 first_frame=1
-  need_render=1 next_render=0 sel_key=""
+  need_render=1 next_render=0 sel_key="" moved=0
+  drawn_sel=0 drawn_status="" drawn_height=0
   cand_file=$cache_dir/candidates.$$ rows_file=$cache_dir/rows.$$
   typeset -a seen_cand frame_lines row_meta
   session_file=$cache_dir/session.$$
@@ -961,17 +969,22 @@ if (( watch )); then
   }
   sel_field() { local -a f=("${(@ps:\t:)row_meta[$1]}"); print -r -- "$f[$2]" }
 
+  # Synchronized output (\e[?2026h ... l): the terminal shows the whole frame
+  # at once, so a redraw does not blink. Terminals without it ignore the codes.
+  # drawn_sel, drawn_status, and drawn_height remember what is on screen, for
+  # draw_move.
   draw() {
     local i line sel_line=0 idx=$(sel_index)
     (( idx )) && sel_line=$(sel_field $idx 1)
-    print -n $'\e[H\e[J'
+    print -n $'\e[?2026h\e[H\e[J'
     for (( i = 1; i <= $#frame_lines; i++ )); do
       line=$frame_lines[$i]
       (( i == sel_line )) && line="${CWT}${B}❯${R}${line[2,-1]}"
       print -r -- "$line"
     done
     if [[ -n $status_msg ]]; then
-      print -r -- "${YEL}$(cut_to "${status_msg//$'\e'\[[0-9;]##m/}" $term_cols)${R}"
+      # One column less: ⏳ is two columns wide.
+      print -r -- "${YEL}$(cut_to "${status_msg//$'\e'\[[0-9;]##m/}" $(( term_cols - 1 )))${R}"
     fi
     # One key per line, all keys in one color, then " - " and what it does.
     key_item() { print -rn -- "${B}$(rgb 70effc)$1${R}${CFR} - $2${R}" }
@@ -988,7 +1001,27 @@ if (( watch )); then
     # Deletes and undos of this session go under the keys.
     local session=$(session_footer)
     [[ -n $session ]] && lines+=("" "${(@f)session}")
-    print -n -- "${(pj:\n:)lines}${R}"
+    print -n -- "${(pj:\n:)lines}${R}"$'\e[?2026l'
+    drawn_sel=$sel_line drawn_status=$status_msg
+    drawn_height=$(( $#frame_lines + (${#status_msg} > 0) + $#lines ))
+  }
+
+  # After ↑ or ↓: redraw only the row the ❯ leaves and the row it moves to,
+  # so the screen does not blink. Frame line i is screen row i, because draw
+  # starts at the top. False when only a full draw is correct: no row was
+  # selected before, the status line changed, or the frame is taller than the
+  # window (then the top rows scrolled away).
+  draw_move() {
+    local idx=$(sel_index) new_line=0 rows
+    (( idx )) && new_line=$(sel_field $idx 1)
+    (( drawn_sel && new_line )) || return 1
+    [[ $status_msg == $drawn_status ]] || return 1
+    rows=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f1)
+    [[ $rows == <-> ]] && (( drawn_height <= rows )) || return 1
+    (( new_line == drawn_sel )) && return 0
+    print -rn -- $'\e[?2026h\e['$drawn_sel$';1H\e[2K'"$frame_lines[$drawn_sel]"
+    print -rn -- $'\e['$new_line$';1H\e[2K'"${CWT}${B}❯${R}${frame_lines[$new_line][2,-1]}"$'\e[?2026l'
+    drawn_sel=$new_line
   }
 
   # Read one answer key. True for y or any form of Enter (newline, carriage
@@ -1024,6 +1057,8 @@ if (( watch )); then
     if ! confirm_key; then
       status_msg="Nothing changed (key: ${(V)answer})" status_ttl=3; return
     fi
+    status_msg="⏳ Switching ${repo:t} to $def, then deleting $br…"
+    draw
     if git -C $repo show-ref -q --verify refs/heads/$def; then
       err=$(git -C $repo switch -q $def 2>&1)
     else
@@ -1068,10 +1103,13 @@ if (( watch )); then
     # Each name gets about a third of the line, so both stay readable.
     local name_max=$(( (${term_cols:-80} - ${#prompt_keys}) / 3 ))
     (( name_max < 12 )) && name_max=12
-    status_msg=$(fit_prompt "${(j:; :)${(f)"$(for entry in $picked; do describe_action $entry $name_max; done)"}}?")
+    local desc="${(j:; :)${(f)"$(for entry in $picked; do describe_action $entry $name_max; done)"}}"
+    status_msg=$(fit_prompt "$desc?")
     draw
     local answer=""
     if confirm_key; then
+      status_msg="⏳ Deleting $desc…"
+      draw
       status_msg="${(j: :)${(f)"$(run_actions $picked 2>&1 | grep -E '✓|✗')"}//  ##/ }" status_ttl=3
       need_render=1
     else
@@ -1086,6 +1124,8 @@ if (( watch )); then
   # branch back from the log.
   force_delete_selected() {
     local idx=$(sel_index) repo br wt why sha step="-" base lost dirty_n
+    local nm=$(( (${term_cols:-80} - ${#prompt_keys}) / 3 ))
+    (( nm < 12 )) && nm=12
     (( idx )) || { status_msg="Select a branch first (↑ ↓)"; return }
     repo=$(sel_field $idx 2) br=$(sel_field $idx 3) wt=$(sel_field $idx 4) why=$(sel_field $idx 6)
     case $why in
@@ -1111,8 +1151,6 @@ if (( watch )); then
     else
       sha=$(git -C $repo rev-parse $br 2>/dev/null)
       lost=$(git -C $repo rev-list --count $base..$br 2>/dev/null)
-      local nm=$(( (${term_cols:-80} - ${#prompt_keys}) / 3 ))
-      (( nm < 12 )) && nm=12
       status_msg=$(fit_prompt "Force-delete $(cut_to $br $nm)${${step:#-}:+ + worktree $(cut_to ${wt:t} $nm)} (${lost:-?} commits not in ${base#origin/}; u undoes)?")
     fi
     draw
@@ -1121,7 +1159,10 @@ if (( watch )); then
       status_msg="Nothing deleted (key: ${(V)answer})" status_ttl=3; return
     fi
     local mode=D; [[ $br == - ]] && mode=-
-    status_msg="${(j: :)${(f)"$(run_tag=force run_actions "$repo"$'\t'$step$'\t'"${wt}"$'\t'$mode$'\t'"$br"$'\t'"$sha"$'\t'- 2>&1 | grep -E '✓|✗')"}//  ##/ }" status_ttl=3
+    local entry="$repo"$'\t'$step$'\t'"${wt}"$'\t'$mode$'\t'"$br"$'\t'"$sha"$'\t'-
+    status_msg="⏳ Deleting ${$(describe_action $entry $nm)//  ##/ }…"
+    draw
+    status_msg="${(j: :)${(f)"$(run_tag=force run_actions $entry 2>&1 | grep -E '✓|✗')"}//  ##/ }" status_ttl=3
     need_render=1
   }
 
@@ -1147,7 +1188,9 @@ if (( watch )); then
   }
 
   while true; do
+    rendered=0
     if (( need_render || EPOCHSECONDS >= next_render )); then
+      rendered=1
       fit_width
       if (( auto )); then
         fetched=$(stat -f %m $fetch_stamp 2>/dev/null || echo 0)
@@ -1177,7 +1220,8 @@ if (( watch )); then
       need_render=0 next_render=$(( EPOCHSECONDS + interval ))
     fi
 
-    draw
+    if (( moved && ! rendered )); then draw_move || draw; else draw; fi
+    moved=0
     if [[ ! -t 0 ]]; then sleep $interval; need_render=1; continue; fi
 
     wait_for=$(( next_render - EPOCHSECONDS )); (( wait_for < 1 )) && wait_for=1
@@ -1188,8 +1232,8 @@ if (( watch )); then
     fi
     case $key in
       q|Q) quit ;;
-      $'\e[A'|k) move_sel -1 ;;
-      $'\e[B'|j) move_sel 1 ;;
+      $'\e[A'|k) move_sel -1; moved=1 ;;
+      $'\e[B'|j) move_sel 1; moved=1 ;;
       o|O) open_selected ;;
       d) delete_selected ;;
       D) force_delete_selected ;;
