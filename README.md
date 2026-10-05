@@ -95,6 +95,7 @@ The keys are listed under the dashboard, one per line:
 | `d` | Delete the selected row, if it is safe (asks; `Enter` or `y` confirms). On a merged branch that is still checked out, it first switches that folder to the default branch (refused if the folder has uncommitted changes). |
 | `D` | Force-delete the selected row's unmerged work (shows the commits lost; `Enter` or `y` confirms) |
 | `x` | Delete all safe rows (a list with everything selected; unselect what to keep) |
+| `X` | Force-delete all **stale, dead** branches: unmerged, no commit for 30+ days, no open PR, GitHub branch deleted or never pushed, no uncommitted changes, not checked out. Same list as `x`, with the commits lost on each line; logged so `u` can restore |
 | `u` | Undo the last delete (the branch comes back; a removed worktree folder does not) |
 | `r` | Refresh from GitHub: fetch every repo and refresh PR status, in the background |
 | `q` | Quit |
@@ -110,8 +111,8 @@ items and auto-deletes send a Mac notification through the terminal.
 | Icon | Group | Meaning | Examples |
 |---|---|---|---|
 | `✂` | safe to delete | `x` and `d` delete it | merged; worktree folder already gone |
-| `?` | needs you | you decide; `D` can force-delete | stale; remote gone; new commits after the merge; merged but has changes or is checked out |
-| `·` | keep | never deleted by `d`, `x`, or auto mode | default branch; protected; new branch; open PR; not merged |
+| `?` | needs you | you decide; `D` (one row) or `X` (all stale, dead ones) can force-delete | stale; remote gone; new commits after the merge; merged but has changes or is checked out |
+| `·` | keep | never deleted by `d`, `x`, or auto mode (`X` can take a stale, dead "not merged" branch) | default branch; protected; new branch; open PR; not merged |
 
 - A **new branch** was created and never committed to. Git calls it merged, because it
   points at a `main` commit, so git herd reads the branch's reflog and keeps it.
