@@ -1,0 +1,1111 @@
+#!/bin/zsh
+# git-herd: the local branches and worktrees of the repos you pick, with cleanup hints.
+#
+#   git herd             watch: refresh every 5 seconds (Ctrl+C to stop)
+#   git herd -w N        watch, refreshing every N seconds
+#   git herd -1          print once and stop (also when output is not a terminal)
+#   git herd -p          pick which repos to herd
+#   git herd -A          watch, and auto-delete merged branches whose remote is gone
+#
+# While watching: ↑ ↓ (or k j) select a row, o open its PR in the browser,
+# d delete that row if it is safe, D force-delete unmerged work in that row
+# (asks, shows what is lost), x delete all safe rows, u undo the last delete,
+# r refresh from GitHub (fetch and PR status), q quit.
+# New cleanup items and auto-deletes send a Mac notification
+# (GIT_HERD_NOTIFY=0 turns it off).
+#
+# The first run asks you to pick repos. Repos are found under GIT_HERD_ROOTS
+# (default: your home folder); your picks are saved in ~/.config/git-herd/repos.
+# Ahead/behind counts are from your last fetch; r and -A fetch.
+
+emulate -L zsh
+zmodload zsh/datetime   # EPOCHSECONDS
+export LC_CTYPE=en_US.UTF-8   # count ↳ ✓ ⇣ as one character each
+setopt extended_glob null_glob
+
+roots=(${=GIT_HERD_ROOTS:-$HOME})
+config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/git-herd
+repos_file=$config_dir/repos
+cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/git-herd
+log_file=${XDG_STATE_HOME:-$HOME/.local/state}/git-herd/deleted.log
+pr_cache_max_age=300   # seconds before the merged-PR list is fetched again (5 min)
+stale_days=30
+protected=(main master staging dev develop production release)   # never flagged
+
+watch=1 asked_watch=0 once=0 interval=5 only_cleanup=0 force_refresh=0 do_pick=0 do_cut=0 auto=0
+while (( $# )); do
+  case $1 in
+    -w) watch=1 asked_watch=1; [[ $2 == <-> ]] && { interval=$2; shift } ;;
+    -1) once=1 ;;
+    -p) do_pick=1 ;;
+    -A) auto=1; watch=1 asked_watch=1 ;;
+    -h|--help) sed -n '2,19p' $0 | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) print -u2 "git-herd: unknown option $1 (git herd -h for help)"; exit 2 ;;
+  esac
+  shift
+done
+# Watch only makes sense on a screen; -1 or piped output prints once.
+(( once )) || [[ ! -t 1 ]] && { watch=0; auto=0 }
+
+# Colors, as hex. Change them here.
+typeset -A color=(
+  repo     70effc   # repo name
+  branch   cfcfcf   # branch name
+  wt       ff66f4   # worktree mark
+  age      9b9b9b   # age, "clean"
+  changed  ffff55   # changed files
+  track    ff55ff   # ahead / behind
+  merged   55ff55   # merged
+  bad      ff5555   # folder gone, errors
+  gone     9b9b9b   # remote deleted
+  hint     ff5555   # cleanup hint
+  frame    5c5c5c   # repo default branch, footer
+)
+if [[ -t 1 ]]; then
+  rgb() { print -rn -- $'\e[38;2;'$(( 16#${1[1,2]} ))';'$(( 16#${1[3,4]} ))';'$(( 16#${1[5,6]} ))'m' }
+  R=$'\e[0m' B=$'\e[1m'
+  CREPO=$(rgb $color[repo]) CBR=$(rgb $color[branch]) CWT=$(rgb $color[wt]) CAGE=$(rgb $color[age])
+  YEL=$(rgb $color[changed]) PNK=$(rgb $color[track]) GRN=$(rgb $color[merged]) RED=$(rgb $color[bad])
+  GRY=$(rgb $color[gone]) CHINT=$(rgb $color[hint]) CFR=$(rgb $color[frame])
+fi
+
+# Every row is in one of three groups:
+#   ✂ safe to delete   x and d delete it
+#   ? needs you        you decide (stale, remote gone, has changes, ...)
+#   · keep             never deleted (default branch, open PR, not merged, ...)
+is_safe_hint() { [[ $1 == 'clean up' || $1 == 'prune worktree' ]] }
+
+
+# Column widths. The layout is at most 80 columns (about 700 px), narrower
+# when the window is. Row: " ✂ " name age size changes reason.
+max_cols=${GIT_HERD_WIDTH:-80}
+label_w=35 age_w=5 size_w=6 chg_w=8 reason_w=23
+fit_width() {
+  local cols=80
+  # Watch mode draws inside $(...), where stdout is not the terminal: ask the tty.
+  if (( watch )) || [[ -t 1 ]]; then cols=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f2); fi
+  [[ $cols == <-> ]] || cols=80
+  (( cols > max_cols )) && cols=$max_cols
+  term_cols=$cols
+  size_w=6
+  (( cols < 70 )) && size_w=0
+  label_w=$(( cols - 3 - age_w - size_w - chg_w - reason_w ))
+  (( label_w < 16 )) && label_w=16
+}
+
+# One branch or worktree row. kind: safe, needs, or keep.
+row_line() {
+  local kind=$1 mark=$2 name=$3 age=$4 size=$5 chg=$6 reason=$7 icon
+  case $kind in
+    safe)  icon="${CHINT}✂${R}" ;;
+    needs) icon="${YEL}?${R}" ;;
+    *)     icon="${CFR}·${R}" ;;
+  esac
+  print -rn -- " ${icon} $(label_cell "$mark" "$name")$(pad "${CAGE}${age}${R}" $age_w)$( (( size_w )) && pad "${CAGE}${size}${R}" $size_w)$(pad "$chg" $chg_w)${reason}"
+}
+
+# Column names over the rows, lined up with row_line.
+header_line() {
+  print -rn -- "${CFR}   $(pad Branch $(( label_w + 1 )))$(pad Age $age_w)$( (( size_w )) && pad Size $size_w)$(pad Changes $chg_w)Status${R}"
+}
+
+# Changed files and ahead/behind, short: "!3 ⇡2⇣7".
+chg_cell() {
+  local dirty=$1 track=$2 out=""
+  (( dirty > 0 )) && out="${YEL}!${dirty}${R}"
+  if [[ -n $track && $track != gone ]]; then
+    track=${track//ahead /⇡}; track=${track//behind /⇣}; track=${track//, /}
+    out="${out:+$out }${PNK}${track}${R}"
+  fi
+  print -rn -- $out
+}
+
+# The reason column: why a row is safe, needs you, or is kept.
+reason_cell() {
+  local hint=$1 keep=$2 br=$3 detached=$4 r
+  case $hint in
+    'clean up')                       r="${CHINT}merged${R}"; (( detached )) && r="${CHINT}in ${default}${R}" ;;
+    'prune worktree')                 r="${CHINT}folder gone${R}" ;;
+    'check: remote gone')             r="${YEL}remote gone${R}" ;;
+    'check: commits after merge')     r="${YEL}new commits after merge${R}" ;;
+    'commit or stash, then clean up') r="${YEL}merged, has changes${R}" ;;
+    'switch branch, then clean up')   r="${YEL}merged, checked out${R}" ;;
+    stale)                            r="${YEL}stale, ${stale_days}d+${R}" ;;
+    '')
+      if [[ $keep == "open PR" && -n $prmap[$br] ]]; then r=$(pr_cell $br)
+      else r="${CFR}${keep}${R}"
+      fi ;;
+    *)                                r="${YEL}${hint}${R}" ;;
+  esac
+  print -rn -- $r
+}
+
+# Branch label padded to the name column: worktree mark in its own color.
+label_cell() {
+  local mark=$1 br=$2 width=$label_w
+  local room=$(( width - ${#mark} ))
+  print -rn -- "$(pad "${mark:+${CWT}${mark}${R}}${CBR}$(cut_to $br $room)${R}" $(( width + 1 )))"
+}
+
+mkdir -p $cache_dir $config_dir ${log_file:h}
+
+# Deletes and undos made while watching, shown under the keys. A file,
+# because d runs the delete in a subshell. Set only in watch mode.
+session_file=""
+session_note() {
+  [[ -n $session_file ]] && print -r -- "$(date +%H:%M) $1" >> $session_file
+}
+
+# Filled by render when -x is used. Each entry, tab-separated:
+# repo, worktree step (remove|prune|-), worktree path, branch delete (d|D|-), branch,
+# commit, upstream state ("gone" when the remote branch is deleted)
+typeset -ga actions
+
+# ---------------------------------------------------------------- repo list
+
+saved_repos() {
+  [[ -f $repos_file ]] && grep -v -E '^[[:space:]]*(#|$)' $repos_file
+}
+
+save_repos() {
+  { print "# Repos git herd watches. One path per line. Change with: git herd -p"
+    print -l -- "$@"; } >| $repos_file
+}
+
+# Every repo under the roots, up to 5 folders deep (a .git folder, so
+# worktrees are skipped), most recently used first. Hidden folders, Library,
+# and node_modules are skipped: they are slow and hold no repos of yours.
+# Output: <last-used-unix>\t<path>
+discover() {
+  local gitdir repo used
+  find $roots -maxdepth 5 \( -name '.?*' ! -name .git -o -name Library -o -name node_modules \) -prune \
+      -o -type d -name .git -print 2>/dev/null |
+  while IFS= read -r gitdir; do
+    repo=${gitdir:h}
+    used=$(stat -f %m $gitdir/logs/HEAD 2>/dev/null || stat -f %m $gitdir/HEAD)
+    print -r -- "$used"$'\t'"$repo"
+  done | sort -t$'\t' -k1,1rn -k2,2
+}
+
+pick_repos() {
+  local -a found current chosen lines
+  local now=$(date +%s) line used repo nb nw i binds=""
+  found=(${(f)"$(discover)"})
+  if (( ! $#found )); then
+    print "No git repos found in: ${${roots[@]/#$HOME/~}}"
+    print "Set GIT_HERD_ROOTS to the folders that hold your repos, then run git herd again."
+    return 2
+  fi
+  current=(${(f)"$(saved_repos)"})
+  (( $#current )) || print "First run: pick the repos to herd.\n"
+
+  i=0
+  for line in $found; do
+    (( i++ ))
+    used=${line%%$'\t'*} repo=${line#*$'\t'}
+    nb=$(git -C $repo for-each-ref refs/heads --format=x 2>/dev/null | wc -l | tr -d ' ')
+    nw=$(( $(git -C $repo worktree list 2>/dev/null | wc -l) - 1 ))
+    lines+=("$(printf '%-30s %3s %-8s  %s  %6s ago   %s' ${repo:t} $nb \
+      "$( (( nb == 1 )) && print branch || print branches)" \
+      "$( (( nw > 0 )) && printf '%2d %-9s' $nw "$( (( nw == 1 )) && print worktree || print worktrees)" || printf '%12s' '')" \
+      $(human_age $(( now - used ))) ${repo/#$HOME/~})"$'\t'"$repo")
+    [[ -n ${current[(r)$repo]} ]] && binds+="pos($i)+select+"
+  done
+
+  if command -v fzf >/dev/null && [[ -t 0 ]]; then
+    chosen=(${(f)"$(print -l -- $lines | fzf --multi --delimiter=$'\t' --with-nth=1 \
+      --prompt='herd> ' --height=80% --reverse --no-sort --marker='● ' --info=inline-right \
+      --header=$'Space, Tab, or click: select   Ctrl-A: all   Enter: save   Esc: cancel\nMost recently used first. The count on the right is how many you picked.' \
+      --bind="space:toggle+down" --bind="left-click:toggle" --bind="double-click:ignore" \
+      --bind="ctrl-a:toggle-all" --bind="load:${binds}first" | cut -f2)"})
+    (( $? == 0 && $#chosen )) || { print -u2 "git-herd: nothing changed"; return 1 }
+  else
+    print "Repos found (most recently used first):"
+    i=0
+    for line in $lines; do
+      (( i++ ))
+      repo=${line#*$'\t'}
+      printf '%3d %s %s\n' $i "$([[ -n ${current[(r)$repo]} ]] && print '●' || print ' ')" "${line%%$'\t'*}"
+    done
+    print -n "Numbers to herd, like 1 4 7 (Enter keeps ●): "
+    read -r line
+    if [[ -z $line ]]; then
+      chosen=($current)
+    else
+      for i in ${=line}; do
+        [[ $i == <-> && $i -ge 1 && $i -le $#found ]] && chosen+=(${found[$i]#*$'\t'})
+      done
+    fi
+    (( $#chosen )) || { print -u2 "git-herd: nothing changed"; return 1 }
+  fi
+
+  save_repos $chosen
+  print "Herding ${#chosen} repos. Saved to ${repos_file/#$HOME/~}"
+}
+
+# ---------------------------------------------------------------- helpers
+
+# Open PRs as tab-separated: branch, number, draft|open, review, CI
+# (pass|fail|pending|none), url.
+open_pr_jq='.[] | ([.statusCheckRollup[]? | (.conclusion // .state // "")]) as $c
+  | [ .headRefName, (.number|tostring), (if .isDraft then "draft" else "open" end),
+      (.reviewDecision // ""),
+      (if ($c|length) == 0 then "none"
+       elif ($c|any(. == "FAILURE" or . == "ERROR" or . == "CANCELLED" or . == "TIMED_OUT" or . == "ACTION_REQUIRED")) then "fail"
+       elif ($c|any(. == "" or . == "PENDING" or . == "IN_PROGRESS" or . == "QUEUED" or . == "EXPECTED" or . == "WAITING")) then "pending"
+       else "pass" end),
+      .url ] | @tsv'
+
+open_prs() {
+  local file=$cache_dir/${${1#/}//\//_}.prs.open
+  [[ -f $file ]] && cat $file
+}
+
+# Merged PRs for a repo as "<branch> <merged commit>", cached so watch mode does
+# not hit GitHub every few seconds. Catches squash merges, which git cannot see.
+# The same refresh also saves the open PRs (see open_prs).
+merged_prs() {
+  local repo=$1 file=$cache_dir/${${1#/}//\//_}.prs
+  local age=$(( $(date +%s) - $(stat -f %m $file 2>/dev/null || echo 0) ))
+  if (( force_refresh || age > pr_cache_max_age )) && [[ ! -e $file.lock ]]; then
+    : >| $file.lock
+    {
+      if git -C $repo remote get-url origin 2>/dev/null | grep -q github.com; then
+        (cd $repo && gh pr list --state merged --limit 300 \
+          --json headRefName,headRefOid -q '.[] | "\(.headRefName) \(.headRefOid)"' >| $file.tmp 2>/dev/null) \
+          && mv $file.tmp $file || rm -f $file.tmp
+        (cd $repo && gh pr list --state open --limit 200 \
+          --json headRefName,number,isDraft,reviewDecision,url,statusCheckRollup \
+          -q "$open_pr_jq" >| $file.open.tmp 2>/dev/null) \
+          && mv $file.open.tmp $file.open || rm -f $file.open.tmp
+      else
+        : >| $file; : >| $file.open
+      fi
+      rm -f $file.lock
+    } >/dev/null 2>&1 &!
+    (( force_refresh )) && while [[ -e $file.lock ]]; do sleep 0.2; done
+  fi
+  [[ -f $file ]] && cat $file
+}
+
+# Disk use of a worktree folder, like 1.2G. Measured in the background every
+# 10 minutes, because du on node_modules takes seconds.
+size_max_age=600
+wt_size_kb() {
+  local wt=$1 file=$cache_dir/size/${${1#/}//\//_}
+  [[ -d $wt ]] || return
+  local age=$(( EPOCHSECONDS - $(stat -f %m $file 2>/dev/null || echo 0) ))
+  if (( age > size_max_age )) && [[ ! -e $file.lock ]]; then
+    mkdir -p ${file:h}; : >| $file.lock
+    { du -sk $wt 2>/dev/null | cut -f1 >| $file.tmp && mv $file.tmp $file; rm -f $file.lock $file.tmp } >/dev/null 2>&1 &!
+  fi
+  [[ -f $file ]] && print -r -- "$(<$file)"
+}
+
+human_kb() {
+  local kb=$1
+  if   (( kb >= 1048576 )); then printf '%.1fG' $(( kb / 1048576.0 ))
+  elif (( kb >= 1024 ));    then printf '%dM' $(( kb / 1024 ))
+  else                           printf '%dK' $kb
+  fi
+}
+
+# PR cell: #123 plus CI (✓ ✗ •) and draft / approved / changes.
+pr_cell() {
+  local info=$prmap[$1]
+  [[ -z $info ]] && return
+  local -a p=("${(@ps:\t:)info}")
+  local out="${CBR}#$p[1]${R}"
+  case $p[4] in
+    pass)    out+=" ${GRN}✓${R}" ;;
+    fail)    out+=" ${RED}✗${R}" ;;
+    pending) out+=" ${YEL}•${R}" ;;
+  esac
+  if [[ $p[2] == draft ]]; then out+=" ${CAGE}draft${R}"
+  else
+    case $p[3] in
+      APPROVED)          out+=" ${GRN}approved${R}" ;;
+      CHANGES_REQUESTED) out+=" ${RED}changes${R}" ;;
+    esac
+  fi
+  print -rn -- $out
+}
+
+# Pad to a visible width, ignoring color codes.
+pad() {
+  local s=$1 w=$2 plain=${1//$'\e'\[[0-9;]##m/}
+  local n=$(( w - ${#plain} ))
+  (( n < 0 )) && n=0
+  print -rn -- "$s${(l:$n:: :)}"
+}
+
+# Cut to a visible width with an ellipsis.
+cut_to() {
+  local s=$1 w=$2
+  (( ${#s} > w )) && s="${s[1,w-1]}…"
+  print -rn -- $s
+}
+
+human_age() {
+  local s=$1
+  if   (( s < 3600 ));   then print "$(( s / 60 ))m"
+  elif (( s < 86400 ));  then print "$(( s / 3600 ))h"
+  else                        print "$(( s / 86400 ))d"
+  fi
+}
+
+# ---------------------------------------------------------------- cleanup (-x)
+
+# Queue a merged branch for -x. Called from render, so it reads render's
+# variables for the current row. -d for git-merged, -D for squash-merged
+# (already checked against the merged commit).
+queue_branch() {
+  local mode=d
+  [[ -z $merged[$br] ]] && mode=D
+  [[ $wt == $repo ]] && return            # checked out in the main folder: switch first
+  if [[ -n $wt && -n $prunable[$wt] ]]; then
+    actions+=("$repo"$'\t'prune$'\t'"$wt"$'\t'$mode$'\t'"$br"$'\t'"$sha"$'\t'"${track:--}")
+  elif [[ -n $wt ]]; then
+    (( dirty > 0 )) && return             # has changes: never remove
+    actions+=("$repo"$'\t'remove$'\t'"$wt"$'\t'$mode$'\t'"$br"$'\t'"$sha"$'\t'"${track:--}")
+  else
+    actions+=("$repo"$'\t'-$'\t'-$'\t'$mode$'\t'"$br"$'\t'"$sha"$'\t'"${track:--}")
+  fi
+  queued=1
+}
+
+# Short, so it fits on one line: "app · delete feat/x + worktree app-x".
+# Worktrees are named by their folder only. An optional second argument cuts
+# each name to that length, so a long branch cannot push the worktree away.
+describe_action() {
+  local -a a=("${(@ps:\t:)1}")
+  local what n=${2:-200}
+  local brn=$(cut_to "$a[5]" $n) wtn=$(cut_to "${a[3]:t}" $n)
+  if [[ $a[4] != - ]]; then
+    case $a[2] in
+      remove) what="delete $brn + worktree $wtn" ;;
+      prune)  what="delete $brn (worktree folder gone)" ;;
+      *)      what="delete $brn" ;;
+    esac
+  else
+    case $a[2] in
+      remove) what="remove worktree $wtn" ;;
+      prune)  what="clear missing worktree $wtn" ;;
+    esac
+  fi
+  print -r -- "${a[1]:t} · $what"
+}
+
+# A question that fits the window: the description is cut with …, never the
+# answer keys at the end.
+prompt_keys="Enter/y = yes · n = no"
+fit_prompt() {
+  local body=$1 room=$(( ${term_cols:-80} - ${#prompt_keys} - 1 ))
+  print -r -- "$(cut_to "$body" $room) $prompt_keys"
+}
+
+# True only for a local branch that is not the repo's default branch, not
+# protected, and not checked out in the main folder.
+safe_to_delete() {
+  local repo=$1 br=$2 def head
+  [[ -z $br || $br == - ]] && return 1
+  git -C $repo show-ref -q --verify refs/heads/$br || return 1
+  def=$(git -C $repo symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+  def=${def#origin/}
+  [[ -n $def && $br == $def ]] && return 1
+  [[ -n ${protected[(r)$br]} ]] && return 1
+  head=$(git -C $repo symbolic-ref -q --short HEAD 2>/dev/null)
+  [[ $br == $head ]] && return 1
+  return 0
+}
+
+run_actions() {
+  local entry ok=0 failed=0
+  local -a a
+  for entry in "$@"; do
+    a=("${(@ps:\t:)entry}")
+    local repo=$a[1] step=$a[2] wt=$a[3] mode=$a[4] br=$a[5] sha=$a[6] err=""
+    # Last check before anything is deleted, whatever put it on the list.
+    if [[ $mode != - ]] && ! safe_to_delete $repo $br; then
+      print "${RED}✗${R} ${repo:t} $br: refused, this is the default, a protected, or the checked-out branch"
+      session_note "${RED}✗${R} ${repo:t} $br: refused (default, protected, or checked out)${run_tag:+ ${CFR}(${run_tag})${R}}"
+      (( failed++ )); continue
+    fi
+    if [[ $step == remove && ${wt:A} == ${repo:A} ]]; then
+      print "${RED}✗${R} ${repo:t}: refused to remove the repo's main folder"
+      session_note "${RED}✗${R} ${repo:t}: refused to remove the main folder${run_tag:+ ${CFR}(${run_tag})${R}}"
+      (( failed++ )); continue
+    fi
+    case $step in
+      remove) err=$(git -C $repo worktree remove $wt 2>&1) || { print "${RED}✗${R} ${repo:t}: $err"; session_note "${RED}✗${R} ${repo:t}: ${err%%$'\n'*}"; (( failed++ )); continue } ;;
+      prune)  git -C $repo worktree prune 2>/dev/null ;;
+    esac
+    if [[ $mode != - ]]; then
+      err=$(git -C $repo branch -$mode $br 2>&1) || { print "${RED}✗${R} ${repo:t} $br: $err"; session_note "${RED}✗${R} ${repo:t} $br: ${err%%$'\n'*}"; (( failed++ )); continue }
+      print -r -- "$(date '+%F %T')	$repo	$br	$sha	${run_tag:-manual}" >> $log_file
+    fi
+    print "${GRN}✓${R} $(describe_action $entry)"
+    session_note "${GRN}✓${R} ${$(describe_action $entry)//  ##/ }${run_tag:+ ${CFR}(${run_tag})${R}}"
+    (( ok++ ))
+  done
+  if (( failed )); then print "\n$ok done, $failed failed."; else print "\n$ok done."; fi
+  (( ok )) && print "${CFR}Undo a branch delete: git -C <repo> branch <name> <commit>. Commits are in ${log_file/#$HOME/~}${R}"
+}
+
+cut_flow() {
+  local -a lines chosen picked
+  local entry i=0
+  if (( ! $#actions )); then
+    print "Nothing safe to delete. Branches with changes, newer local commits,"
+    print "a deleted remote, or no activity are left for you to check."
+    return 0
+  fi
+  for entry in $actions; do
+    (( i++ ))
+    lines+=("$(describe_action $entry)"$'\t'$i)
+  done
+  print
+  if command -v fzf >/dev/null && [[ -t 0 ]]; then
+    chosen=(${(f)"$(print -l -- $lines | fzf --multi --delimiter=$'\t' --with-nth=1 \
+      --prompt='delete> ' --height=60% --reverse --no-sort --marker='● ' --info=inline-right \
+      --header=$'Everything below is selected. Space, Tab, or click: unselect\nEnter: delete the selected   Esc: cancel' \
+      --bind="space:toggle+down" --bind="left-click:toggle" --bind="double-click:ignore" \
+      --bind="load:select-all" | cut -f2)"})
+  else
+    print -l -- ${lines%%$'\t'*}
+    print -n "\nDelete all ${#lines} of these? [y/N] "
+    local answer; read -r answer
+    [[ $answer == [yY]* ]] && chosen=({1..$#lines})
+  fi
+  (( $#chosen )) || { print "Nothing deleted."; return 0 }
+  for i in $chosen; do picked+=("$actions[$i]"); done
+  run_actions $picked
+}
+
+# ---------------------------------------------------------------- undo (u)
+
+# Bring back the most recent deleted branch that does not exist again yet.
+# Worktree folders cannot come back; only the branch does.
+undo_last() {
+  local line repo br sha
+  local -a f
+  [[ -f $log_file ]] || { print "Nothing to undo."; return 1 }
+  for line in ${(Oaf)"$(<$log_file)"}; do
+    f=("${(@ps:\t:)line}")
+    repo=$f[2] br=$f[3] sha=$f[4]
+    [[ -d $repo/.git ]] || continue
+    git -C $repo show-ref -q --verify refs/heads/$br && continue
+    if git -C $repo branch $br $sha 2>/dev/null; then
+      print "Restored ${repo:t} ${br} at ${sha[1,7]}"
+      session_note "${YEL}↶${R} restored ${repo:t} ${br}"
+      return 0
+    fi
+    print "Could not restore ${repo:t} ${br}: commit ${sha[1,7]} is gone"
+    return 1
+  done
+  print "Nothing to undo."
+  return 1
+}
+
+# ---------------------------------------------------------------- notifications
+
+# Mac notification through the terminal (OSC 9; Ghostty and iTerm show it).
+notify() {
+  [[ ${GIT_HERD_NOTIFY:-1} == 0 || ! -t 1 ]] && return
+  print -n $'\e]9;'"git herd: $1"$'\a' > /dev/tty
+}
+
+# ---------------------------------------------------------------- auto mode (-A)
+
+fetch_stamp=$cache_dir/last-fetch
+
+# `git fetch --prune` every herded repo in the background, so "remote deleted"
+# shows up without you fetching. Never prompts for a password.
+fetch_all() {
+  [[ -e $fetch_stamp.lock ]] && return
+  : >| $fetch_stamp.lock
+  {
+    local repo
+    for repo in ${(f)"$(saved_repos)"}; do
+      [[ -d $repo/.git ]] || continue
+      GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes' \
+        git -C $repo fetch --prune --quiet origin 2>/dev/null
+    done
+    : >| $fetch_stamp
+    rm -f $fetch_stamp.lock
+  } >/dev/null 2>&1 &!
+}
+
+# Delete what is merged AND has its remote deleted. Same safety as -x:
+# protected branches, the branch checked out in the main folder, and
+# worktrees with changes are never touched.
+auto_pass() {
+  local entry
+  local -a a picked
+  actions=()
+  do_cut=1; render >/dev/null; do_cut=0
+  for entry in $actions; do
+    a=("${(@ps:\t:)entry}")
+    [[ $a[4] != - && $a[7] == gone ]] && picked+=("$entry")
+  done
+  (( $#picked )) || return 0
+  # run_actions records each result in the session list; collect them to notify.
+  local line
+  local -a done_now
+  for line in ${(f)"$(run_tag=auto run_actions $picked 2>&1)"}; do
+    [[ $line == *✓* ]] && done_now+=("${${line//$'\e'\[[0-9;]##m/}#✓ }")
+  done
+  (( $#done_now )) && notify "auto-deleted ${#done_now}: ${(j:; :)${done_now//  ##/ }}"
+  return 0
+}
+
+auto_footer() {
+  local today=$(date +%F) n last
+  n=$(grep -c "^$today.*	auto\$" $log_file 2>/dev/null)
+  last=$(grep "	auto\$" $log_file 2>/dev/null | tail -1)
+  if [[ -n $last ]]; then
+    local -a f=("${(@ps:\t:)last}")
+    print "${CFR}auto-delete on · ${n:-0} today · last: ${f[2]:t} ${f[3]} at ${${f[1]#* }%:*}${R}"
+  else
+    print "${CFR}auto-delete on · nothing deleted yet${R}"
+  fi
+}
+
+# The latest deletes and undos of this watch session, shown under the keys.
+session_footer() {
+  [[ -s $session_file ]] || return 0
+  local -a recent=(${(f)"$(tail -8 $session_file)"})
+  print "${CFR}This session:${R}"
+  local line
+  for line in $recent; do
+    line=$(cut_to "${line//$'\e'\[[0-9;]##m/}" $(( term_cols - 2 )))
+    print -r -- "  ${CFR}${line[1,5]}${R}${line[6,-1]}"
+  done
+}
+
+# ---------------------------------------------------------------- dashboard
+
+render() {
+  fit_width
+  local now=$(date +%s) total_repos=0 total_branches=0 total_wt=0 total_safe=0 total_needs=0
+  local -a out rows f detached
+  local -A merged prs prunable wt_head merged_oid
+  local repo name default b line wt_path br when track wt sha label state hint keep fresh created chg dirty age repo_has_rows oid squash queued repo_hints default_state kb size_txt
+  local -a cand rows_meta all_meta
+  local -A prmap
+  local total_kb=0 i
+  out=("$(header_line)")
+
+  # Repos in alphabetical order by folder name.
+  for repo in ${(f)"$(saved_repos | awk -F/ '{print $NF "\t" $0}' | sort -f | cut -f2)"}; do
+    repo=${repo:A}   # real path: git reports worktrees without symlinks (/tmp is /private/tmp)
+    name=${repo:t}
+    (( total_repos++ ))
+    if [[ ! -d $repo/.git ]]; then
+      out+=("${B}${CREPO}${name}${R} ${RED}folder missing: ${repo/#$HOME/~}${R} ${CFR}(git herd -p to update)${R}")
+      continue
+    fi
+
+    default=$(git -C $repo symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+    default=${default#origin/}
+    [[ -z $default ]] && default=main
+    git -C $repo show-ref -q --verify refs/heads/$default || default=master
+
+    merged=() prs=() prunable=() merged_oid=()
+    for b in ${(f)"$(git -C $repo branch --format='%(refname:short)' --merged $default 2>/dev/null)"}; do
+      merged[$b]=1
+    done
+    for b in ${(f)"$(merged_prs $repo)"}; do
+      [[ $b == *' '* ]] || continue
+      prs[${b%% *}]+="${b#* } "
+      merged_oid[${b#* }]=1
+    done
+
+    # Worktrees whose folder is gone (git lists them until pruned), and
+    # worktrees with no branch checked out, which for-each-ref below misses.
+    wt_path="" detached=() wt_head=()
+    for line in ${(f)"$(git -C $repo worktree list --porcelain 2>/dev/null)"}; do
+      [[ $line == worktree\ * ]] && wt_path=${line#worktree }
+      [[ $line == HEAD\ * ]] && wt_head[$wt_path]=${line#HEAD }
+      [[ $line == prunable* ]] && prunable[$wt_path]=1
+      [[ $line == detached ]] && detached+=($wt_path)
+    done
+
+    rows=() rows_meta=() prmap=()
+    repo_has_rows=0 repo_hints=0 default_state=""
+    for b in ${(f)"$(open_prs $repo)"}; do
+      prmap[${b%%$'\t'*}]=${b#*$'\t'}
+    done
+    for line in ${(f)"$(git -C $repo for-each-ref refs/heads \
+        --format='%(refname:short)%09%(committerdate:unix)%09%(upstream:track,nobracket)%09%(worktreepath)%09%(objectname)')"}; do
+      f=("${(@ps:\t:)line}")
+      br=$f[1] when=$f[2] track=$f[3] wt=$f[4] sha=$f[5] dirty=0 queued=0 fresh=0
+      (( total_branches++ ))
+
+      label="" state="" hint=""
+      if [[ -n $wt && $wt != $repo ]]; then
+        label="↳ wt: "; (( total_wt++ ))
+      fi
+
+      if [[ -n $wt && -n $prunable[$wt] ]]; then
+        state="${RED}folder gone${R}"; hint="prune worktree"
+      elif [[ -n $wt && -d $wt ]]; then
+        dirty=$(git -C $wt status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        (( dirty > 0 )) && state="${YEL}${dirty} changed${R}"
+      fi
+
+      if [[ $track == gone ]]; then
+        state="${state:+$state, }${GRY}remote deleted${R}"
+      elif [[ -n $track ]]; then
+        track=${track//ahead /⇡}; track=${track//behind /⇣}; track=${track//, / }
+        state="${state:+$state, }${PNK}${track}${R}"
+      fi
+
+      if [[ $br != $default && -z ${protected[(r)$br]} ]]; then
+        # A squash merge counts only if GitHub merged this exact commit (or a
+        # newer one that contains it), so local work after the merge is kept.
+        squash=0
+        # Merged under another branch name (pushed as a different branch, or
+        # the PR was opened by someone else): match the exact commit.
+        [[ -z $merged[$br] && -n $merged_oid[$sha] ]] && squash=1
+        if [[ -z $merged[$br] && $squash == 0 && -n $prs[$br] ]]; then
+          for oid in ${=prs[$br]}; do
+            if [[ $sha == $oid ]] || git -C $repo merge-base --is-ancestor $sha $oid 2>/dev/null; then
+              squash=1; break
+            fi
+          done
+        fi
+        # A branch git calls merged only because it has no commits yet (just
+        # created from main) is new work, not finished work. Its reflog shows
+        # it was created and never committed to.
+        fresh=0
+        if [[ -n $merged[$br] ]] && (( ! squash )) && [[ -z $prs[$br] ]]; then
+          b=$(git -C $repo reflog show --format=%gs refs/heads/$br -- 2>/dev/null)
+          if [[ -n $b ]] && ! print -r -- $b | grep -qv '^branch: Created'; then
+            fresh=1
+            created=$(git -C $repo reflog show --date=unix --format=%gd refs/heads/$br -- 2>/dev/null | tail -1)
+            created=${${created##*\{}%\}}
+            [[ $created == <-> ]] || created=$now
+          fi
+        fi
+        if (( fresh )); then
+          (( now - created > stale_days * 86400 )) && hint=${hint:-stale}
+        elif [[ -n $merged[$br] ]] || (( squash )); then
+          state="${state:+$state, }${GRN}merged ✓${R}"
+          if [[ $wt == $repo ]]; then hint=${hint:-switch branch, then clean up}
+          elif (( dirty > 0 )); then hint=${hint:-commit or stash, then clean up}
+          else hint=${hint:-clean up}
+          fi
+          (( do_cut )) && queue_branch
+        elif [[ -n $prs[$br] ]]; then
+          state="${state:+$state, }${YEL}PR merged, newer local commits${R}"; hint=${hint:-check: commits after merge}
+        elif [[ $track == gone ]]; then
+          hint=${hint:-check: remote gone}
+        elif (( now - when > stale_days * 86400 )); then
+          hint=${hint:-stale}
+        fi
+      fi
+      # A worktree whose folder is gone: drop git's leftover entry, keep the branch.
+      if (( do_cut && ! queued )) && [[ -n $wt && -n $prunable[$wt] ]]; then
+        actions+=("$repo"$'\t'prune$'\t'"$wt"$'\t'-$'\t'"$br"$'\t'"$sha"$'\t'-)
+      fi
+      [[ -z $state ]] && state="${CAGE}no changes${R}"
+
+      # Rows with no cleanup hint say why x and d will not delete them.
+      keep=""
+      if [[ -z $hint ]]; then
+        if   [[ $br == $default ]];          then keep="default branch"
+        elif [[ -n ${protected[(r)$br]} ]];  then keep="protected"
+        elif (( fresh ));                    then keep="new branch"
+        elif [[ -n $prmap[$br] ]];           then keep="open PR"
+        else                                      keep="not merged"
+        fi
+      fi
+
+      if [[ -n $hint ]]; then
+        (( repo_hints += 1 ))
+        if is_safe_hint $hint; then (( total_safe += 1 )); else (( total_needs += 1 )); fi
+        cand+=("${name} ${br}")
+      fi
+      (( only_cleanup && ${#hint} == 0 )) && [[ $br != $default ]] && continue   # always show the default branch
+
+      age=$(human_age $(( now - when )))
+      size_txt=""
+      if [[ -n $wt && $wt != $repo && -z $prunable[$wt] ]]; then
+        kb=$(wt_size_kb $wt); [[ -n $kb ]] && { size_txt=$(human_kb $kb); (( total_kb += kb )) }
+      fi
+      chg=$(chg_cell $dirty $f[3])
+      [[ $br == $default ]] && default_state=${chg:-${CAGE}no changes${R}}
+      rows+=("$(row_line $( [[ -n $hint ]] && { is_safe_hint $hint && print safe || print needs } || print keep ) "${label:+↳ }" $br $age "$size_txt" "$chg" "$(reason_cell "$hint" "$keep" $br 0)")")
+      rows_meta+=("$repo"$'\t'"$br"$'\t'"${wt:--}"$'\t'"${${(ps:\t:)prmap[$br]}[5]:--}"$'\t'"${hint:-${keep:--}}")
+      repo_has_rows=1
+    done
+
+    for wt in $detached; do
+      (( total_wt++ ))
+      label="↳ wt (no branch): " state="" hint=""
+      when=$(git -C $repo log -1 --format=%ct $wt_head[$wt] 2>/dev/null || echo $now)
+      if [[ -n $prunable[$wt] ]]; then
+        state="${RED}folder gone${R}"; hint="prune worktree"
+        (( do_cut )) && actions+=("$repo"$'\t'prune$'\t'"$wt"$'\t'-$'\t'-$'\t'"$wt_head[$wt]"$'\t'-)
+      else
+        dirty=$(git -C $wt status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        (( dirty > 0 )) && state="${YEL}${dirty} changed${R}"
+        if git -C $repo merge-base --is-ancestor $wt_head[$wt] $default 2>/dev/null; then
+          state="${state:+$state, }${GRN}in ${default} ✓${R}"
+          if (( dirty == 0 )); then
+            hint="clean up"
+            (( do_cut )) && actions+=("$repo"$'\t'remove$'\t'"$wt"$'\t'-$'\t'-$'\t'"$wt_head[$wt]"$'\t'-)
+          fi
+        elif (( now - when > stale_days * 86400 )); then
+          hint="stale"
+        fi
+      fi
+      keep=""
+      if [[ -z $hint ]]; then
+        if (( dirty > 0 )); then keep="has changes"; else keep="not in ${default}"; fi
+      fi
+      [[ -z $state ]] && state="${CAGE}no changes${R}"
+
+      if [[ -n $hint ]]; then
+        (( repo_hints += 1 ))
+        if is_safe_hint $hint; then (( total_safe += 1 )); else (( total_needs += 1 )); fi
+        cand+=("${name} ${wt:t}")
+      fi
+      (( only_cleanup && ${#hint} == 0 )) && continue
+
+      age=$(human_age $(( now - when )))
+      size_txt=""
+      if [[ -z $prunable[$wt] ]]; then
+        kb=$(wt_size_kb $wt); [[ -n $kb ]] && { size_txt=$(human_kb $kb); (( total_kb += kb )) }
+      fi
+      chg=$(chg_cell $dirty "")
+      rows+=("$(row_line $( [[ -n $hint ]] && { is_safe_hint $hint && print safe || print needs } || print keep ) "↳ " "${wt:t} (no branch)" $age "$size_txt" "$chg" "$(reason_cell "$hint" "$keep" - 1)")")
+      rows_meta+=("$repo"$'\t'-$'\t'"$wt"$'\t'-$'\t'"${hint:-${keep:--}}")
+      repo_has_rows=1
+    done
+
+    if (( only_cleanup && repo_hints == 0 )); then
+      # Nothing to clean: one line, still showing the default branch.
+      out+=("${B}${CREPO}${name}${R} ${CFR}(${default})${R} ${GRN}✓ tidy${R} ${CFR}·${R} ${default_state}")
+    elif (( repo_has_rows )); then
+      out+=("${B}${CREPO}${name}${R} ${CFR}(${default})${R}")
+      # Remember which frame line each row is on, for arrow-key selection.
+      for (( i = 1; i <= $#rows; i++ )); do
+        all_meta+=("$(( $#out + i ))"$'\t'"$rows_meta[$i]")
+      done
+      out+=($rows)
+    fi
+  done
+  # Cleanup items for this frame, so watch mode can notify about new ones.
+  [[ -n $cand_file ]] && print -l -- $cand >| $cand_file
+  [[ -n $rows_file ]] && print -l -- $all_meta >| $rows_file
+
+  print -l -- $out
+  print
+  # Most useful first; the counts only when the window has room.
+  local main_part="${CHINT}✂ ${B}${total_safe}${R}${CHINT} safe${R}${CFR} · ${R}${YEL}? ${B}${total_needs}${R}${YEL} needs you${R}${CFR} · $(date +%H:%M)${R}"
+  local counts="${total_repos} repos · ${total_branches} branches · ${total_wt} wt$( (( total_kb )) && print " $(human_kb $total_kb)")"
+  local plain=${main_part//$'\e'\[[0-9;]##m/}
+  if (( ${#plain} + 3 + ${#counts} <= term_cols )); then
+    print -r -- "${main_part}${CFR} · ${counts}${R}"
+  else
+    print -r -- $main_part
+  fi
+  if (( auto )); then auto_footer; fi
+}
+
+# ---------------------------------------------------------------- main
+
+if (( do_pick )) || [[ -z "$(saved_repos)" ]]; then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    print -u2 "git-herd: no repos picked yet. Run \`git herd -p\` in a terminal."
+    exit 1
+  fi
+  pick_repos
+  case $? in
+    0) ;;
+    2) exit 0 ;;                                  # no repos on this Mac: nothing to do
+    *) [[ -z "$(saved_repos)" ]] && print "No repos picked. Run git herd -p when you are ready."
+       exit 0 ;;
+  esac
+  # `git herd -p` alone only edits the list; the first run goes on to show it.
+  (( do_pick && ! asked_watch && ! only_cleanup )) && exit 0
+fi
+
+if (( watch )); then
+  # Plain VT100 codes, so redraw works in any terminal: alternate screen on,
+  # cursor hidden; restored on quit.
+  screen_on()  { print -n $'\e[?1049h\e[?25l\e[H\e[2J' }
+  screen_off() { print -n $'\e[?25h\e[?1049l' }
+  last_auto=0 status_msg="" status_ttl=0 fetching=0 first_frame=1
+  need_render=1 next_render=0 sel_key=""
+  cand_file=$cache_dir/candidates.$$ rows_file=$cache_dir/rows.$$
+  typeset -a seen_cand frame_lines row_meta
+  session_file=$cache_dir/session.$$
+  : >| $session_file
+  quit() { screen_off; rm -f $cand_file $rows_file $session_file; exit 0 }
+  trap quit INT TERM HUP
+  screen_on
+
+  # The row under the cursor: repo, branch (or -), worktree (or -), PR url (or -), hint.
+  sel_index() {
+    local i
+    for (( i = 1; i <= $#row_meta; i++ )); do
+      [[ ${row_meta[$i]#*$'\t'} == ${(b)sel_key}$'\t'* ]] && { print $i; return }
+    done
+    print 0
+  }
+  sel_field() { local -a f=("${(@ps:\t:)row_meta[$1]}"); print -r -- "$f[$2]" }
+
+  draw() {
+    local i line sel_line=0 idx=$(sel_index)
+    (( idx )) && sel_line=$(sel_field $idx 1)
+    print -n $'\e[H\e[J'
+    for (( i = 1; i <= $#frame_lines; i++ )); do
+      line=$frame_lines[$i]
+      (( i == sel_line )) && line="${CWT}${B}❯${R}${line[2,-1]}"
+      print -r -- "$line"
+    done
+    if [[ -n $status_msg ]]; then
+      print -r -- "${YEL}$(cut_to "${status_msg//$'\e'\[[0-9;]##m/}" $term_cols)${R}"
+    fi
+    # One key per line, all keys in one color, then " - " and what it does.
+    key_item() { print -rn -- "${B}$(rgb 70effc)$1${R}${CFR} - $2${R}" }
+    local -a lines=(
+      "$(key_item '↑↓' 'select a row')"
+      "$(key_item o 'open its PR')"
+      "$(key_item d 'delete if safe')"
+      "$(key_item D 'force-delete')"
+      "$(key_item x 'delete all safe')"
+      "$(key_item u 'undo last delete')"
+      "$(key_item r 'refresh from GitHub')"
+      "$(key_item q 'quit')"
+    )
+    # Deletes and undos of this session go under the keys.
+    local session=$(session_footer)
+    [[ -n $session ]] && lines+=("" "${(@f)session}")
+    print -n -- "${(pj:\n:)lines}${R}"
+  }
+
+  # Read one answer key. True for y or any form of Enter (newline, carriage
+  # return, keypad Enter "Esc O M", kitty keyboard Enter). Sets answer.
+  confirm_key() {
+    answer=""
+    read -s -k 1 answer
+    if [[ $answer == $'\e' ]]; then
+      local c=""
+      while read -s -t 0.03 -k 1 c; do answer+=$c; done
+    fi
+    [[ $answer == ([yY]|$'\n'|$'\r'|$'\eOM'|$'\e[13u'|$'\e[13;1u') || -z $answer ]]
+  }
+
+  # The branch is merged but checked out in the repo's main folder, so git
+  # will not delete it. Switch that folder to the default branch, then delete
+  # it with the usual rules. Refuses when the folder has uncommitted changes.
+  switch_then_delete() {
+    local repo=$1 br=$2 def n entry err
+    local -a a picked
+    n=$(git -C $repo status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if (( n > 0 )); then
+      status_msg="Not deletable: $n uncommitted changes in ${repo:t}" status_ttl=3; return
+    fi
+    def=$(git -C $repo symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+    def=${def#origin/}
+    if [[ -z $def ]]; then
+      def=main; git -C $repo show-ref -q --verify refs/heads/main || def=master
+    fi
+    status_msg=$(fit_prompt "Switch ${repo:t} to $def, then delete $br?")
+    draw
+    local answer=""
+    if ! confirm_key; then
+      status_msg="Nothing changed (key: ${(V)answer})" status_ttl=3; return
+    fi
+    if git -C $repo show-ref -q --verify refs/heads/$def; then
+      err=$(git -C $repo switch -q $def 2>&1)
+    else
+      err=$(git -C $repo switch -q -c $def --track origin/$def 2>&1)
+    fi
+    if (( $? )); then
+      status_msg="Could not switch ${repo:t} to $def: ${err%%$'\n'*}" status_ttl=4; return
+    fi
+    actions=(); do_cut=1; render >/dev/null; do_cut=0
+    for entry in $actions; do
+      a=("${(@ps:\t:)entry}")
+      [[ $a[1] == $repo && $a[5] == $br ]] && picked+=("$entry")
+    done
+    if (( ! $#picked )); then
+      status_msg="Switched ${repo:t} to $def; $br is still not safe to delete" status_ttl=4; need_render=1; return
+    fi
+    status_msg="Switched to $def. ${(j: :)${(f)"$(run_actions $picked 2>&1 | grep -E '✓|✗')"}}" status_ttl=3
+    need_render=1
+  }
+
+  # Delete only the selected row, with the same rules and final check as -x.
+  delete_selected() {
+    local idx=$(sel_index) repo br wt hint entry
+    local -a a picked
+    (( idx )) || { status_msg="Select a branch first (↑ ↓)"; return }
+    repo=$(sel_field $idx 2) br=$(sel_field $idx 3) wt=$(sel_field $idx 4) hint=$(sel_field $idx 6)
+    actions=(); do_cut=1; render >/dev/null; do_cut=0
+    for entry in $actions; do
+      a=("${(@ps:\t:)entry}")
+      [[ $a[1] != $repo ]] && continue
+      if [[ $br != - && $a[5] == $br ]] || [[ $br == - && $a[3] == $wt ]]; then
+        picked+=("$entry")
+      fi
+    done
+    if (( ! $#picked )) && [[ $hint == 'switch branch, then clean up' ]]; then
+      switch_then_delete $repo $br; return
+    fi
+    if (( ! $#picked )); then
+      status_msg="Not deletable: ${${hint:#-}:-not merged, or it is the default branch}" status_ttl=3
+      return
+    fi
+    # Each name gets about a third of the line, so both stay readable.
+    local name_max=$(( (${term_cols:-80} - ${#prompt_keys}) / 3 ))
+    (( name_max < 12 )) && name_max=12
+    status_msg=$(fit_prompt "${(j:; :)${(f)"$(for entry in $picked; do describe_action $entry $name_max; done)"}}?")
+    draw
+    local answer=""
+    if confirm_key; then
+      status_msg="${(j: :)${(f)"$(run_actions $picked 2>&1 | grep -E '✓|✗')"}//  ##/ }" status_ttl=3
+      need_render=1
+    else
+      status_msg="Nothing deleted (key: ${(V)answer})" status_ttl=3
+    fi
+  }
+
+  # Force-delete the selected row even though its work is not merged. Only for
+  # "needs you" rows and "keep · not merged": never the default or a protected
+  # branch, a branch with an open PR, the checked-out branch, or a worktree
+  # with uncommitted changes. Shows how many commits are lost; u brings the
+  # branch back from the log.
+  force_delete_selected() {
+    local idx=$(sel_index) repo br wt why sha step="-" base lost dirty_n
+    (( idx )) || { status_msg="Select a branch first (↑ ↓)"; return }
+    repo=$(sel_field $idx 2) br=$(sel_field $idx 3) wt=$(sel_field $idx 4) why=$(sel_field $idx 6)
+    case $why in
+      'clean up'|'prune worktree')          status_msg="This one is merged: use d"; status_ttl=2; return ;;
+      'default branch'|protected|'open PR') status_msg="Not deletable: $why"; status_ttl=3; return ;;
+      'switch branch, then clean up')       status_msg="Not deletable: checked out in the main folder"; status_ttl=3; return ;;
+    esac
+    if [[ $wt != - && -d $wt ]]; then
+      dirty_n=$(git -C $wt status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      (( dirty_n > 0 )) && { status_msg="Not deletable: $dirty_n uncommitted changes in ${wt:t}"; status_ttl=3; return }
+      step=remove
+    elif [[ $wt != - ]]; then
+      step=prune
+    fi
+    base=$(git -C $repo symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+    if [[ -z $base ]]; then    # no GitHub remote: compare with the local main or master
+      base=main; git -C $repo show-ref -q --verify refs/heads/main || base=master
+    fi
+    if [[ $br == - ]]; then
+      sha=$(git -C $wt rev-parse HEAD 2>/dev/null)
+      lost=$(git -C $repo rev-list --count $base..$sha 2>/dev/null)
+      status_msg=$(fit_prompt "Force-remove worktree ${wt:t} (${lost:-?} commits not in ${base#origin/})?")
+    else
+      sha=$(git -C $repo rev-parse $br 2>/dev/null)
+      lost=$(git -C $repo rev-list --count $base..$br 2>/dev/null)
+      local nm=$(( (${term_cols:-80} - ${#prompt_keys}) / 3 ))
+      (( nm < 12 )) && nm=12
+      status_msg=$(fit_prompt "Force-delete $(cut_to $br $nm)${${step:#-}:+ + worktree $(cut_to ${wt:t} $nm)} (${lost:-?} commits not in ${base#origin/}; u undoes)?")
+    fi
+    draw
+    local answer=""
+    if ! confirm_key; then
+      status_msg="Nothing deleted (key: ${(V)answer})" status_ttl=3; return
+    fi
+    local mode=D; [[ $br == - ]] && mode=-
+    status_msg="${(j: :)${(f)"$(run_tag=force run_actions "$repo"$'\t'$step$'\t'"${wt}"$'\t'$mode$'\t'"$br"$'\t'"$sha"$'\t'- 2>&1 | grep -E '✓|✗')"}//  ##/ }" status_ttl=3
+    need_render=1
+  }
+
+  open_selected() {
+    local idx=$(sel_index) url br
+    (( idx )) || { status_msg="Select a branch first (↑ ↓)"; return }
+    url=$(sel_field $idx 5) br=$(sel_field $idx 3)
+    if [[ $url == - || -z $url ]]; then
+      status_msg="No open PR for ${br:#-}" status_ttl=2
+    else
+      open $url; status_msg="Opened ${url##*/pull/} in the browser" status_ttl=2
+    fi
+  }
+
+  move_sel() {
+    local idx=$(sel_index) n=$#row_meta
+    (( n )) || return
+    if (( idx == 0 )); then idx=1
+    else idx=$(( idx + $1 )); (( idx < 1 )) && idx=1; (( idx > n )) && idx=n
+    fi
+    sel_key=${row_meta[$idx]#*$'\t'}
+    sel_key=${sel_key%$'\t'*$'\t'*}     # repo, branch, worktree
+  }
+
+  while true; do
+    if (( need_render || EPOCHSECONDS >= next_render )); then
+      fit_width
+      if (( auto )); then
+        fetched=$(stat -f %m $fetch_stamp 2>/dev/null || echo 0)
+        (( EPOCHSECONDS - fetched >= pr_cache_max_age )) && fetch_all
+        # Act once per finished fetch, so decisions use fresh remote state.
+        if [[ ! -e $fetch_stamp.lock ]] && (( fetched > last_auto )); then
+          auto_pass; last_auto=$fetched
+        fi
+      fi
+      frame=$(render)
+      force_refresh=0   # -r refreshes once at the start, then every 5 minutes as usual
+      frame_lines=("${(@f)frame}")
+      row_meta=(${(f)"$(<$rows_file 2>/dev/null)"})
+
+      # Notify about cleanup items that were not there on the last frame.
+      now_cand=(${(f)"$(<$cand_file 2>/dev/null)"})
+      if (( ! first_frame )); then
+        new_cand=(${now_cand:|seen_cand})
+        (( $#new_cand )) && notify "${#new_cand} new to clean up: ${(j:, :)new_cand}"
+      fi
+      seen_cand=($now_cand) first_frame=0
+
+      if (( fetching )) && [[ ! -e $fetch_stamp.lock ]]; then
+        fetching=0 status_msg="Refreshed from GitHub at $(date +%H:%M)" status_ttl=2
+      fi
+      (( status_ttl > 0 )) && (( --status_ttl == 0 )) && (( ! fetching )) && status_msg=""
+      need_render=0 next_render=$(( EPOCHSECONDS + interval ))
+    fi
+
+    draw
+    if [[ ! -t 0 ]]; then sleep $interval; need_render=1; continue; fi
+
+    wait_for=$(( next_render - EPOCHSECONDS )); (( wait_for < 1 )) && wait_for=1
+    key=""
+    read -s -k 1 -t $wait_for key || continue
+    if [[ $key == $'\e' ]]; then
+      rest=""; read -s -k 2 -t 0.05 rest; key+=$rest
+    fi
+    case $key in
+      q|Q) quit ;;
+      $'\e[A'|k) move_sel -1 ;;
+      $'\e[B'|j) move_sel 1 ;;
+      o|O) open_selected ;;
+      d) delete_selected ;;
+      D) force_delete_selected ;;
+      r|R)
+        # Mark the PR caches old so they refresh in the background (no wait),
+        # and fetch every repo so deleted remote branches show up.
+        for b in $cache_dir/*.prs(N); do touch -t 197001010000 $b; done
+        fetch_all; fetching=1 status_msg="Refreshing from GitHub…" need_render=1 ;;
+      u|U) status_msg=$(undo_last) status_ttl=3 first_frame=1 need_render=1 ;;   # no alert for what you restored
+      x|X)
+        print -n $'\e[?25h\e[H\e[2J'
+        keep=$only_cleanup; only_cleanup=1
+        actions=(); do_cut=1; render; do_cut=0
+        cut_flow
+        only_cleanup=$keep
+        print -n "\n${CFR}Press any key to go back${R}"; read -s -k 1
+        print -n $'\e[?25l\e[H\e[2J'; need_render=1 ;;
+    esac
+  done
+else
+  render
+fi
