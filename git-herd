@@ -17,6 +17,12 @@
 # The first run asks you to pick repos. Repos are found under GIT_HERD_ROOTS
 # (default: your home folder); your picks are saved in ~/.config/git-herd/repos.
 # Ahead/behind counts are from your last fetch; r and -A fetch.
+#
+# For scripts and apps (no colors, no questions):
+#   git herd --porcelain [--refresh]          one tab-separated line per row
+#   git herd --delete <repo> <branch>         delete one row, only if d would
+#   git herd --delete <repo> --worktree <path>   same, picked by worktree folder
+#   git herd --undo                           restore the last deleted branch
 
 emulate -L zsh
 zmodload zsh/datetime   # EPOCHSECONDS
@@ -33,19 +39,28 @@ stale_days=30
 protected=(main master staging dev develop production release)   # never flagged
 
 watch=1 asked_watch=0 once=0 interval=5 only_cleanup=0 force_refresh=0 do_pick=0 do_cut=0 auto=0
+machine="" refresh=0 del_repo="" del_br="" del_wt=""   # machine: porcelain, delete, or undo
 while (( $# )); do
   case $1 in
     -w) watch=1 asked_watch=1; [[ $2 == <-> ]] && { interval=$2; shift } ;;
     -1) once=1 ;;
     -p) do_pick=1 ;;
     -A) auto=1; watch=1 asked_watch=1 ;;
-    -h|--help) sed -n '2,19p' $0 | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --porcelain) machine=porcelain ;;
+    --refresh) refresh=1 ;;
+    --undo) machine=undo ;;
+    --delete)
+      machine=delete del_repo=$2
+      if [[ $3 == --worktree ]]; then del_wt=$4; shift 3; else del_br=$3; shift 2; fi
+      [[ -n $del_repo && -n $del_br$del_wt ]] || {
+        print -u2 "git-herd: usage: git herd --delete <repo> <branch>  or  --delete <repo> --worktree <path>"; exit 2 } ;;
+    -h|--help) sed -n '2,25p' $0 | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) print -u2 "git-herd: unknown option $1 (git herd -h for help)"; exit 2 ;;
   esac
   shift
 done
 # Watch only makes sense on a screen; -1 or piped output prints once.
-(( once )) || [[ ! -t 1 ]] && { watch=0; auto=0 }
+(( once )) || [[ ! -t 1 ]] || [[ -n $machine ]] && { watch=0; auto=0 }
 
 # Colors, as hex. Change them here.
 typeset -A color=(
@@ -61,7 +76,7 @@ typeset -A color=(
   hint     ff5555   # cleanup hint
   frame    5c5c5c   # repo default branch, footer
 )
-if [[ -t 1 ]]; then
+if [[ -t 1 && -z $machine ]]; then
   rgb() { print -rn -- $'\e[38;2;'$(( 16#${1[1,2]} ))';'$(( 16#${1[3,4]} ))';'$(( 16#${1[5,6]} ))'m' }
   R=$'\e[0m' B=$'\e[1m'
   CREPO=$(rgb $color[repo]) CBR=$(rgb $color[branch]) CWT=$(rgb $color[wt]) CAGE=$(rgb $color[age])
@@ -587,6 +602,21 @@ session_footer() {
   done
 }
 
+# ---------------------------------------------------------------- porcelain
+
+# One --porcelain line, tab-separated. Called from render, so it reads render's
+# variables for the current row. Fields: repo, branch, worktree, group, reason,
+# age seconds, changed files, ahead, behind, size KB, PR number, PR url,
+# PR state, PR CI, PR review. "-" when there is no value.
+porcelain_row() {
+  local br=$1 wt=$2 group=$3 reason=$4 track=$5 kb=$6 ahead=0 behind=0
+  local -a p=(- - - - -)
+  [[ $track =~ 'ahead ([0-9]+)' ]] && ahead=$match[1]
+  [[ $track =~ 'behind ([0-9]+)' ]] && behind=$match[1]
+  [[ $br != - && -n $prmap[$br] ]] && p=("${(@ps:\t:)prmap[$br]}")
+  porc+=("$repo"$'\t'"$br"$'\t'"${wt:--}"$'\t'"$group"$'\t'"${reason//$'\e'\[[0-9;]##m/}"$'\t'$(( now - when ))$'\t'$dirty$'\t'$ahead$'\t'$behind$'\t'"${kb:--}"$'\t'"${p[1]:--}"$'\t'"${p[5]:--}"$'\t'"${p[2]:--}"$'\t'"${p[4]:--}"$'\t'"${p[3]:--}")
+}
+
 # ---------------------------------------------------------------- dashboard
 
 render() {
@@ -597,7 +627,8 @@ render() {
   local repo name default b line wt_path br when track wt sha label state hint keep fresh created chg dirty age repo_has_rows oid squash queued repo_hints default_state kb size_txt
   local -a cand rows_meta all_meta
   local -A prmap
-  local total_kb=0 i
+  local total_kb=0 i group
+  typeset -ga porc=()
   out=("$(header_line)")
 
   # Repos in alphabetical order by folder name.
@@ -607,6 +638,7 @@ render() {
     (( total_repos++ ))
     if [[ ! -d $repo/.git ]]; then
       out+=("${B}${CREPO}${name}${R} ${RED}folder missing: ${repo/#$HOME/~}${R} ${CFR}(git herd -p to update)${R}")
+      porc+=("$repo"$'\t'-$'\t'-$'\t'needs$'\t'"folder missing"$'\t'0$'\t'0$'\t'0$'\t'0$'\t'-$'\t'-$'\t'-$'\t'-$'\t'-$'\t'-)
       continue
     fi
 
@@ -734,20 +766,27 @@ render() {
       (( only_cleanup && ${#hint} == 0 )) && [[ $br != $default ]] && continue   # always show the default branch
 
       age=$(human_age $(( now - when )))
-      size_txt=""
+      size_txt="" kb=""
       if [[ -n $wt && $wt != $repo && -z $prunable[$wt] ]]; then
         kb=$(wt_size_kb $wt); [[ -n $kb ]] && { size_txt=$(human_kb $kb); (( total_kb += kb )) }
       fi
+      group=keep; [[ -n $hint ]] && { is_safe_hint $hint && group=safe || group=needs }
+      if [[ $machine == porcelain ]]; then
+        if [[ -z $hint && $keep == "open PR" ]]; then porcelain_row $br "$wt" $group "open PR" "$f[3]" "$kb"
+        else porcelain_row $br "$wt" $group "$(reason_cell "$hint" "$keep" $br 0)" "$f[3]" "$kb"
+        fi
+        repo_has_rows=1; continue
+      fi
       chg=$(chg_cell $dirty $f[3])
       [[ $br == $default ]] && default_state=${chg:-${CAGE}no changes${R}}
-      rows+=("$(row_line $( [[ -n $hint ]] && { is_safe_hint $hint && print safe || print needs } || print keep ) "${label:+↳ }" $br $age "$size_txt" "$chg" "$(reason_cell "$hint" "$keep" $br 0)")")
+      rows+=("$(row_line $group "${label:+↳ }" $br $age "$size_txt" "$chg" "$(reason_cell "$hint" "$keep" $br 0)")")
       rows_meta+=("$repo"$'\t'"$br"$'\t'"${wt:--}"$'\t'"${${(ps:\t:)prmap[$br]}[5]:--}"$'\t'"${hint:-${keep:--}}")
       repo_has_rows=1
     done
 
     for wt in $detached; do
       (( total_wt++ ))
-      label="↳ wt (no branch): " state="" hint=""
+      label="↳ wt (no branch): " state="" hint="" dirty=0
       when=$(git -C $repo log -1 --format=%ct $wt_head[$wt] 2>/dev/null || echo $now)
       if [[ -n $prunable[$wt] ]]; then
         state="${RED}folder gone${R}"; hint="prune worktree"
@@ -779,12 +818,17 @@ render() {
       (( only_cleanup && ${#hint} == 0 )) && continue
 
       age=$(human_age $(( now - when )))
-      size_txt=""
+      size_txt="" kb=""
       if [[ -z $prunable[$wt] ]]; then
         kb=$(wt_size_kb $wt); [[ -n $kb ]] && { size_txt=$(human_kb $kb); (( total_kb += kb )) }
       fi
+      group=keep; [[ -n $hint ]] && { is_safe_hint $hint && group=safe || group=needs }
+      if [[ $machine == porcelain ]]; then
+        porcelain_row - "$wt" $group "$(reason_cell "$hint" "$keep" - 1)" "" "$kb"
+        repo_has_rows=1; continue
+      fi
       chg=$(chg_cell $dirty "")
-      rows+=("$(row_line $( [[ -n $hint ]] && { is_safe_hint $hint && print safe || print needs } || print keep ) "↳ " "${wt:t} (no branch)" $age "$size_txt" "$chg" "$(reason_cell "$hint" "$keep" - 1)")")
+      rows+=("$(row_line $group "↳ " "${wt:t} (no branch)" $age "$size_txt" "$chg" "$(reason_cell "$hint" "$keep" - 1)")")
       rows_meta+=("$repo"$'\t'-$'\t'"$wt"$'\t'-$'\t'"${hint:-${keep:--}}")
       repo_has_rows=1
     done
@@ -804,6 +848,10 @@ render() {
   # Cleanup items for this frame, so watch mode can notify about new ones.
   [[ -n $cand_file ]] && print -l -- $cand >| $cand_file
   [[ -n $rows_file ]] && print -l -- $all_meta >| $rows_file
+  if [[ $machine == porcelain ]]; then
+    (( $#porc )) && print -l -- $porc
+    return 0
+  fi
 
   print -l -- $out
   print
@@ -820,6 +868,57 @@ render() {
 }
 
 # ---------------------------------------------------------------- main
+
+# ---------------------------------------------------------------- script commands
+
+# --delete: delete one row, only if d would delete it, through the same
+# run_actions. Exit 0 deleted, 1 refused (not safe), 3 no such repo or row,
+# 4 git failed. One line of output.
+delete_row() {
+  local repo=${del_repo:A} wt=${del_wt:+${del_wt:A}} br=${del_br:--} entry line hint="" out
+  local -a a picked meta
+  local r found=0
+  for r in ${(f)"$(saved_repos)"}; do [[ ${r:A} == $repo ]] && found=1; done
+  (( found )) || { print -u2 "git-herd: not a herded repo: $del_repo"; return 3 }
+  rows_file=$cache_dir/rows.delete.$$
+  actions=(); do_cut=1; render >/dev/null; do_cut=0
+  meta=(${(f)"$(<$rows_file 2>/dev/null)"}); rm -f $rows_file; rows_file=""
+  # Meta fields: frame line, repo, branch, worktree, PR url, hint or keep reason.
+  for line in $meta; do
+    a=("${(@ps:\t:)line}")
+    [[ $a[2] != $repo ]] && continue
+    if [[ $br != - && $a[3] == $br ]] || [[ $br == - && $a[4] == $wt ]]; then
+      hint=$a[6] br=$a[3]; break
+    fi
+  done
+  [[ -z $hint ]] && { print -u2 "git-herd: no such row in ${repo:t}: ${del_br:-$del_wt}"; return 3 }
+  for entry in $actions; do
+    a=("${(@ps:\t:)entry}")
+    [[ $a[1] != $repo ]] && continue
+    if [[ $br != - && $a[5] == $br ]] || [[ $br == - && $a[5] == - && $a[3] == $wt ]]; then
+      picked+=("$entry")
+    fi
+  done
+  (( $#picked )) || { print -u2 "git-herd: refused, not safe to delete: ${$(reason_cell "$hint" "" - 0)//$'\e'\[[0-9;]##m/}"; return 1 }
+  out=$(run_actions $picked 2>&1 | grep -E '✓|✗')
+  print -r -- "${(j: :)${(f)out}}"
+  [[ $out == *✗* ]] && return 4
+  return 0
+}
+
+if [[ -n $machine ]]; then
+  if [[ $machine == undo ]]; then undo_last; exit $?; fi
+  [[ -z "$(saved_repos)" ]] && { print -u2 "git-herd: no repos picked yet. Run \`git herd -p\` in a terminal."; exit 1 }
+  if [[ $machine == delete ]]; then delete_row; exit $?; fi
+  if (( refresh )); then
+    # Fetch every repo and refresh PR data, and wait for both (at most 2 minutes).
+    fetch_all
+    for (( i = 0; i < 600; i++ )); do [[ -e $fetch_stamp.lock ]] || break; sleep 0.2; done
+    force_refresh=1
+  fi
+  render
+  exit 0
+fi
 
 if (( do_pick )) || [[ -z "$(saved_repos)" ]]; then
   if [[ ! -t 0 || ! -t 1 ]]; then

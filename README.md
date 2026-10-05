@@ -168,6 +168,63 @@ merged and already deleted on GitHub, in a separate worktree, and you do not cha
 anything. Auto mode sees finished work and removes it within about 5 minutes. Press `u`
 to bring the branch back. As soon as you edit a file, rule 4 protects it.
 
+## For scripts and apps
+
+These commands never ask questions and print no colors. A menu bar app or a script can
+use them.
+
+```bash
+git herd --porcelain                       # one line per row (see below)
+git herd --porcelain --refresh             # fetch and refresh PR data first (waits)
+git herd --delete <repo> <branch>          # delete one row, only if d would
+git herd --delete <repo> --worktree <path> # the same, picked by worktree folder
+git herd --undo                            # restore the last deleted branch
+```
+
+### `--porcelain` format
+
+One line per row, fields separated by a tab, in this order. The order will not change;
+new fields are added at the end only. A field with no value is `-`. Values are never cut.
+There is no header line and no totals line.
+
+| # | Field | Example |
+|---|---|---|
+| 1 | Repo path | `/Users/me/code/app` |
+| 2 | Branch, or `-` for a worktree with no branch | `feat/login` |
+| 3 | Worktree path (the repo path for the main folder), or `-` | `/Users/me/code/app-login` |
+| 4 | Group: `safe`, `needs`, or `keep` | `safe` |
+| 5 | Reason, as on the dashboard | `merged`, `remote gone`, `open PR` |
+| 6 | Age in seconds (last commit) | `86400` |
+| 7 | Changed files in the worktree | `3` |
+| 8 | Commits ahead of the remote branch | `2` |
+| 9 | Commits behind the remote branch | `0` |
+| 10 | Worktree size in KB (measured in the background; `-` until known) | `1468006` |
+| 11 | Open PR number | `214` |
+| 12 | Open PR url | `https://github.com/me/app/pull/214` |
+| 13 | PR state: `open` or `draft` | `open` |
+| 14 | PR CI: `pass`, `fail`, `pending`, or `none` | `pass` |
+| 15 | PR review: `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, or `-` | `APPROVED` |
+
+A repo folder that is gone gives one line with branch `-`, group `needs`, and reason
+`folder missing`.
+
+### `--delete` and `--undo`
+
+`--delete` deletes only a row that `d` deletes, with the same final check and the same
+undo log. It does not switch a checked-out branch away first; that row is refused. The
+repo must be one of your herded repos. It prints one line.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Deleted |
+| `1` | Refused: the row is not safe to delete (the line says why) |
+| `2` | Wrong arguments |
+| `3` | Not a herded repo, or no such branch or worktree |
+| `4` | git failed during the delete |
+
+`--undo` restores the last deleted branch, like `u`. Exit code `0` means restored; `1` means
+nothing to undo, or the commit is gone.
+
 ## Settings
 
 | Variable | Default | Effect |
