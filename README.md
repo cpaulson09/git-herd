@@ -172,3 +172,8 @@ Colors, the 30-day stale limit, and the protected branch names are at the top of
 | `~/.config/git-herd/repos` | The repos you picked |
 | `~/.cache/git-herd/` | PR data from GitHub and worktree sizes (refreshed in the background) |
 | `~/.local/state/git-herd/deleted.log` | Every deleted branch with its commit, for undo |
+
+## License
+
+MIT. See [LICENSE](LICENSE). The software is provided as is, without warranty: `git herd`
+deletes branches and worktrees, so check what it will delete before you confirm.
