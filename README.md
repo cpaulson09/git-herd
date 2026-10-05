@@ -31,27 +31,40 @@ use, uncommitted files (`!3`), ahead/behind GitHub (`⇡1 ⇣7`), and its open P
 review state. It finds squash merges that git cannot see, by asking GitHub which commit
 each PR merged.
 
-## Requirements
-
-macOS, zsh, git 2.23 or later, and these Homebrew packages:
-
-```bash
-brew install gh fzf
-gh auth login
-```
-
-`gh` gives PR status and finds squash merges. `fzf` is the picker; without it, a
-numbered list is used.
-
 ## Install
 
+macOS only. Pick one of the three ways:
+
+**1. Homebrew (recommended).** Installs `gh` and `fzf` too, and `brew upgrade` updates it.
+
 ```bash
-gh repo clone cpaulson09/git-herd ~/code/git-herd
+brew install cpaulson09/tap/git-herd
+```
+
+**2. One-line script.** Downloads `git-herd` into `~/.local/bin`. Run it again to update.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cpaulson09/git-herd/main/install.sh | bash
+```
+
+**3. From a clone.** Links the clone into `~/.local/bin`, so `git pull` updates it.
+
+```bash
+git clone https://github.com/cpaulson09/git-herd.git ~/code/git-herd
 ~/code/git-herd/install.sh
 ```
 
-`install.sh` links `git-herd` into `~/.local/bin`, which must be on your `PATH`. Because
-the file is named `git-herd`, git runs it as `git herd`.
+Ways 2 and 3 need `~/.local/bin` on your `PATH`, and `gh` and `fzf` installed
+(`brew install gh fzf`); the script tells you if any is missing.
+
+Then sign in to GitHub once, so git herd can show PR status and find squash merges:
+
+```bash
+gh auth login
+```
+
+It needs zsh and git 2.23 or later, which macOS has. Without `fzf`, the repo picker is
+a numbered list. Because the file is named `git-herd`, git runs it as `git herd`.
 
 ## Use
 
