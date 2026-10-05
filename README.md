@@ -78,7 +78,8 @@ git herd -h        # help (git turns --help into a man-page lookup)
 ```
 
 The first run lists every repo in your home folder, up to 5 folders deep (it skips hidden
-folders, `Library`, and `node_modules`), most recently used first, with branch and
+folders, `Library`, `node_modules`, and `~/Music`, `~/Movies`, `~/Pictures`,
+`~/Applications`, and `~/Public`, so macOS does not ask for media access), most recently used first, with branch and
 worktree counts, and asks you to pick. In the picker: `Space`, `Tab`, or
 a click selects (several at once), `Ctrl-A` selects all, `Enter` saves. Your picks are
 saved in `~/.config/git-herd/repos`. If no repos are found, it says so and stops.
