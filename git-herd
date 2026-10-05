@@ -175,10 +175,14 @@ save_repos() {
 # Every repo under the roots, up to 5 folders deep (a .git folder, so
 # worktrees are skipped), most recently used first. Hidden folders, Library,
 # and node_modules are skipped: they are slow and hold no repos of yours.
+# ~/Music, ~/Movies, ~/Pictures, ~/Applications, and ~/Public are skipped too:
+# macOS guards the media folders and would ask for Apple Music or Photos access.
 # Output: <last-used-unix>\t<path>
 discover() {
   local gitdir repo used
-  find $roots -maxdepth 5 \( -name '.?*' ! -name .git -o -name Library -o -name node_modules \) -prune \
+  find $roots -maxdepth 5 \( -name '.?*' ! -name .git -o -name Library -o -name node_modules \
+      -o -path $HOME/Music -o -path $HOME/Movies -o -path $HOME/Pictures \
+      -o -path $HOME/Applications -o -path $HOME/Public \) -prune \
       -o -type d -name .git -print 2>/dev/null |
   while IFS= read -r gitdir; do
     repo=${gitdir:h}
