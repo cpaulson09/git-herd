@@ -53,12 +53,6 @@ gh repo clone cpaulson09/git-herd ~/code/git-herd
 `install.sh` links `git-herd` into `~/.local/bin`, which must be on your `PATH`. Because
 the file is named `git-herd`, git runs it as `git herd`.
 
-## Try it on made-up repos
-
-`demo/make-demo.sh` builds two made-up repos in `/tmp/git-herd-demo` and starts git herd
-on them, with its own settings, so your real repos and picks are not touched. It is also
-how the example above and the screenshot were made.
-
 ## Use
 
 ```bash
